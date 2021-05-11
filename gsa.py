@@ -98,8 +98,8 @@ res = preprocess()
 print("PREPROCESS DONE")
 one_mask = torch.ones(size=(num_bands,)).to(device)
 # PARAMS
-alpha = 1
-beta = 0
+alpha = 0.7
+beta = 0.2
 compressedbands = 70
 totalbands = 200
 totalsamples = 60

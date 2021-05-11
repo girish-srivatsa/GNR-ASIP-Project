@@ -147,8 +147,34 @@ def score(x_tensor=x_tensor, y_tensor=y_tensor, mask=one_mask, num_class=16, alp
     return alpha * accuracy + beta * mean_distance + (1 - alpha - beta) * band_corr
 
 
+def fast_score(x_tensor=x_tensor, y_tensor=y_tensor, mask=one_mask, num_class=16, verbose=False):
+    # SAM CLASSIFICATION
+    x_tensor_masked = torch.mul(x_tensor, mask)  # MUL1
+    mask_mean = mask.broadcast_to((num_class, num_bands))
+    mean_stack_masked = torch.mul(res["mean_stack"], mask_mean)  # MUL2
+    mean_stack_masked = mean_stack_masked.t()
+
+    dots = torch.mm(x_tensor_masked, mean_stack_masked)  # MM1
+
+    norm_x = torch.sqrt(torch.sum(x_tensor_masked.pow_(2), dim=1)).view(-1, 1)  # SUM1(10000*2000)
+
+    norm_mean = torch.sqrt(torch.sum(mean_stack_masked.pow_(2), dim=0)).view(1, -1)  # SUM2(16*200)
+
+    norm_product = torch.mm(norm_x, norm_mean)  # MM2
+
+    cosines = torch.div(dots, norm_product)  # DIV1
+
+    result = torch.argmax(cosines, dim=1) if torch.cuda.is_available() else torch.from_numpy(
+        indexFunc4(cosines.numpy()))
+    # ACCURACY MEASUREMENT
+    accuracy = torch.sum(result == y_tensor, dtype=torch.int16) / x_tensor.shape[0]  # SUM3(10000)
+    return accuracy
+
+
 for _ in range(10):
     score()
+    fast_score()
+
 
 true_labels = y_tensor.cpu().numpy()
 
@@ -162,13 +188,14 @@ def comp(mask=one_mask):
 
 
 class GSA:
-    def __init__(self):
+    def __init__(self,fast=False):
         self.population = [torch.zeros((totalbands,), device=device) for _ in range(totalsamples)]
 
         for j in range(totalsamples):
             randomiser = np.random.choice(totalbands, size=compressedbands, replace=False)
             for i in range(compressedbands):
                 self.population[j][randomiser[i]] = 1
+        self.calc = fast_score if fast else score
 
     def selection(self):
         newpop = [self.population[i] for i in range(totalsamples)]
@@ -232,7 +259,7 @@ class GSA:
         """
         BASELINE BENCHMARK - 6 ms per individual
       """
-        fits = {p: score(mask=p) for p in self.population}
+        fits = {p: self.calc(mask=p) for p in self.population}
         self.population = sorted(self.population, key=lambda x: fits[x], reverse=True)
 
     def generate(self):

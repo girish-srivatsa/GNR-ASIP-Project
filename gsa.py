@@ -4,10 +4,13 @@ import scipy.io as sio
 import os
 from numba import prange, njit
 import time
+import argparse
 import matplotlib.pyplot as plt
 from numpy.random.mtrand import _rand as global_randstate
-from kmeans_pytorch import kmeans
-from sklearn.metrics import adjusted_mutual_info_score as ami
+from sklearn.metrics import confusion_matrix
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import ConfusionMatrixDisplay
+from sklearn.metrics import cohen_kappa_score
 
 
 def pin_states():
@@ -28,10 +31,31 @@ class TorchStandardScaler:
         return x
 
 
-# Load all paths
-root_path = os.getcwd()
-data_path = root_path + '/data/Indian_pines_corrected.mat'
-gt_path = root_path + '/data/Indian_pines_gt.mat'
+parser = argparse.ArgumentParser(description='GSA Parameters')
+
+#Input paths
+parser.add_argument('data_path', type=str, help='path for input data')
+parser.add_argument('gt_path', type=str, help='path for ground truth data')
+#Params
+parser.add_argument('alpha', type=float, help='alpha')
+parser.add_argument('beta', type=float, help='beta')
+parser.add_argument('compressedbands', type=int, help='compressed bands')
+parser.add_argument('totalbands', type=int, help='total bands')
+parser.add_argument('totalsamples', type=int, help='total samples')
+parser.add_argument('pcross', type=float, help='pcross')
+parser.add_argument('pmut', type=float, help='pmut')
+parser.add_argument('pswap', type=float, help='pswap')
+parser.add_argument('generations', type=int, help='generations')
+#Output paths
+parser.add_argument('output_dir', type=str, help='output directory')
+
+args = parser.parse_args()
+
+
+data_path = args.data_path
+gt_path = args.gt_path 
+output_dir = args.output_dir 
+
 # Load all data files
 image_array = sio.loadmat(data_path)['indian_pines_corrected']
 ground_truth = sio.loadmat(gt_path)['indian_pines_gt']
@@ -51,10 +75,34 @@ scaler.fit(x_tensor)
 x_tensor = scaler.transform(x_tensor).to(device)
 ones = torch.ones(size=(x_tensor.shape[0],)).to(device)
 y_tensor = torch.sub(y_tensor, ones).to(device)
+x_tensor_np = x_tensor.cpu().numpy()
+y_tensor_np = y_tensor.cpu().numpy()
+x_tensor_train, x_tensor_test, y_tensor_train, y_tensor_test = train_test_split(x_tensor_np, y_tensor_np,test_size=0.1,random_state=42)
+x_tensor = torch.from_numpy(x_tensor_train).to(device)
+y_tensor = torch.from_numpy(y_tensor_train).to(device)
+y_tensor_test = torch.from_numpy(y_tensor_test).to(device)
+x_tensor_test = torch.from_numpy(x_tensor_test).to(device)
 num_bands = x_tensor.shape[1]
-x_tensor_slice = [x_tensor[:, i] for i in range(num_bands)]
 torch.set_num_threads(4)
 print("ALL DATA LOADED")
+
+
+def corrcoef(x):
+    # calculate covariance matrix of rows
+    c = x.t().mm(x)
+    c = c / (x.size(0) - 1)
+
+    # normalize covariance matrix
+    d = torch.diag(c)
+    stddev = torch.pow(d, 0.5)
+    c = c.div(stddev.expand_as(c))
+    c = c.div(stddev.expand_as(c).t())
+
+    # clamp between -1 and 1
+    # probably not necessary but numpy does it
+    c = torch.clamp(c, -1.0, 1.0)
+
+    return c
 
 
 # Preprocessing to improve speed
@@ -73,7 +121,7 @@ def preprocess(x_tensor=x_tensor, y_tensor=y_tensor, num_class=16):
 
     res["mean_diffs"] = (res["mean_stack"].unsqueeze(1) - res["mean_stack"])
 
-    res["correlation"] = torch.add(res["covariance"], res["band_mean_product"])
+    res["correlation"] = corrcoef(x_tensor)
     # REMOVE COMMON CORRELATIONS
     res["correlation"] = res["correlation"].fill_diagonal_(0)
 
@@ -97,16 +145,19 @@ if not torch.cuda.is_available():
 res = preprocess()
 print("PREPROCESS DONE")
 one_mask = torch.ones(size=(num_bands,)).to(device)
+
 # PARAMS
-alpha = 1
-beta = 0
-compressedbands = 70
-totalbands = 200
-totalsamples = 60
-pcross = 0.7
-pmut = 0.8
-pswap = 0.3
-generations = 200
+
+
+alpha = args.alpha
+beta = args.beta
+compressedbands = args.compressedbands
+totalbands = args.totalbands
+totalsamples = args.totalsamples
+pcross = args.pcross
+pmut = args.pmut
+pswap = args.pswap
+generations = args.generations
 
 
 def score(x_tensor=x_tensor, y_tensor=y_tensor, mask=one_mask, num_class=16, alpha=alpha, beta=beta, verbose=False):
@@ -141,7 +192,7 @@ def score(x_tensor=x_tensor, y_tensor=y_tensor, mask=one_mask, num_class=16, alp
     no_bands = torch.sum(mask, dtype=torch.int32)  # SUM5(200)
 
     masked_correlation = torch.mul(res["correlation"], mask_2d)  # MUL4
-    band_corr = torch.sum(masked_correlation) / (no_bands * (no_bands - 1))  #
+    band_corr = torch.sum(torch.abs(masked_correlation)) / (no_bands * (no_bands - 1))  #
     if verbose:
         print(accuracy, mean_distance, band_corr)
     return alpha * accuracy + beta * mean_distance + (1 - alpha - beta) * band_corr
@@ -175,20 +226,12 @@ for _ in range(10):
     score()
     fast_score()
 
-
 true_labels = y_tensor.cpu().numpy()
 
 
-def comp(mask=one_mask):
-    cluster_ids_x, cluster_centers = kmeans(
-        X=torch.mul(x_tensor, mask), num_clusters=16, distance='euclidean', device=torch.device('cuda:0')
-    )
-    cluster_ids_x = cluster_ids_x.cpu().numpy()
-    return ami(cluster_ids_x, true_labels)
-
 
 class GSA:
-    def __init__(self,fast=False):
+    def __init__(self, fast=False):
         self.population = [torch.zeros((totalbands,), device=device) for _ in range(totalsamples)]
 
         for j in range(totalsamples):
@@ -435,11 +478,76 @@ class GSA:
 
 
 pin_states()
-gsa = GSA()
+gsa = GSA(fast=True)
 print("GSA GENERATIONS STARTING")
 for _ in range(generations):
     gsa.generate()
-print("MEASURING PERFORMANCE BY AMI OF KMEANS")
-scores = [comp(gsa.population[i]) for i in range(10)]
-print("BEST OF TOP TEN AMI SCORE : ", max(scores))
-print("TOP TEN MEAN AMI SCORE : ", sum(scores) / len(scores))
+print("GENERATING STATS AND PLOTS")
+num_class = 16
+winner = gsa.population[0]
+bands = torch.nonzero(winner, as_tuple=True)[0]
+compressed_x = flattened_image[:, bands.cpu().numpy()]
+compressed_image = compressed_x.reshape((145, 145, -1))
+np.save(output_dir + '/compressed_indianpines.npy', compressed_image)
+
+x_tensor_test_masked = torch.mul(x_tensor_test, winner)
+mask_mean = winner.broadcast_to((num_class, num_bands))
+mean_stack_masked = torch.mul(res["mean_stack"], mask_mean)
+mean_stack_masked = mean_stack_masked.t()
+mean_stack_one = res["mean_stack"]
+mean_stack_one = mean_stack_one.t()
+dots = torch.mm(x_tensor_test_masked, mean_stack_masked)
+dots_one = torch.mm(x_tensor_test, mean_stack_one)
+norm_x = torch.sqrt(torch.sum(x_tensor_test_masked.pow_(2), dim=1)).view(-1, 1)
+norm_x_one = torch.sqrt(torch.sum(x_tensor_test.pow_(2), dim=1)).view(-1, 1)
+norm_mean = torch.sqrt(torch.sum(mean_stack_masked.pow_(2), dim=0)).view(1, -1)
+norm_mean_one = torch.sqrt(torch.sum(mean_stack_one.pow_(2), dim=0)).view(1, -1)
+norm_product = torch.mm(norm_x, norm_mean)
+norm_product_one = torch.mm(norm_x_one, norm_mean_one)
+cosines = torch.div(dots, norm_product)
+cosines_one = torch.div(dots_one, norm_product_one)
+result_comp = torch.argmax(cosines, dim=1) if torch.cuda.is_available() else torch.from_numpy(
+    indexFunc4(cosines.numpy()))
+result_orig = torch.argmax(cosines_one, dim=1) if torch.cuda.is_available() else torch.from_numpy(
+    indexFunc4(cosines_one.numpy()))
+
+
+np.save(output_dir + '/compressed_results.npy', result_comp.cpu().numpy())
+np.save(output_dir + '/original_results.npy', result_orig.cpu().numpy())
+np.save(output_dir + '/true_labels.npy', y_tensor_test.cpu().numpy())
+map_class = {
+    0: "Alfalfa",
+    1: "Corn-notill",
+    2: "Corn-mintill",
+    3: "Corn",
+    4: "Grass-pasture",
+    5: "Grass-trees",
+    6: "Grass-pasture-mowed",
+    7: "Hay-windrowed",
+    8: "Oats",
+    9: "Soybean-notill",
+    10: "Soybean-mintill",
+    11: "Soybean-clean",
+    12: "Wheat",
+    13: "Woods",
+    14: "Buildings-Grass-Trees-Drives",
+    15: "Stone-Steel-Towers"
+}
+classes = [map_class[i] for i in range(16)]
+y_comp = result_comp.cpu().numpy().tolist()
+y_full = result_orig.cpu().numpy().tolist()
+y_true = y_tensor_test.cpu().numpy().tolist()
+y_comp = [map_class[x] for x in y_comp]
+y_full = [map_class[x] for x in y_full]
+y_true = [map_class[x] for x in y_true]
+print("KAPPA SCORES:")
+print("FULL BAND CASE :",cohen_kappa_score(y_full, y_true))
+print("COMPRESSED BAND CASE :",cohen_kappa_score(y_comp, y_true))
+matrix_full = confusion_matrix(y_true, y_full, labels=classes)
+matrix_comp = confusion_matrix(y_true, y_comp, labels=classes)
+disp = ConfusionMatrixDisplay(confusion_matrix=matrix_full, display_labels=classes)
+disp.plot()
+disp.figure_.savefig(output_dir + "/full_band_confusion.png")
+disp = ConfusionMatrixDisplay(confusion_matrix=matrix_comp, display_labels=classes)
+disp.plot()
+disp.figure_.savefig(output_dir + "/compressed_band_confusion.png")
